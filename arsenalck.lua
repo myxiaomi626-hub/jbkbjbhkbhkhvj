@@ -97,6 +97,8 @@ local triggerbotOn   = false
 local killAllOn      = false
 local speedOn        = false
 local speedValue     = 50
+local infiniteJumpOn = false
+local silentAimOn    = false
 
 -- ==================== TABS ====================
 Window:DrawCategory({ Name = "Combat" })
@@ -239,6 +241,8 @@ AimbotOptions:AddSlider({
     end,
 })
 
+-- ИСПРАВЛЕНО: smooth=0 (слайдер 0) → резкий снап, smooth=1 (слайдер 1) — тоже снап, выше — плавнее
+-- Слайдер от 0 до 50, 0 = мгновенный снап
 AimbotOptions:AddSlider({
     Name    = "Smoothness",
     Flag    = "AimbotSmooth",
@@ -246,7 +250,15 @@ AimbotOptions:AddSlider({
     Max     = 50,
     Default = 0,
     Round   = 0,
-    Callback = function(v) aimbotSmooth = v / 100 end,
+    Callback = function(v)
+        -- При v=0 или v=1 — резкий снап (lerp factor = 1)
+        -- При v>1 — плавный (lerp factor = 1 / v)
+        if v <= 1 then
+            aimbotSmooth = 1
+        else
+            aimbotSmooth = 1 / v
+        end
+    end,
 })
 
 AimbotOptions:AddDropdown({
@@ -279,6 +291,108 @@ AimbotOptions:AddToggle({
     Default = true,
     Callback = function() end,
 })
+
+-- ==================== SILENT AIM ====================
+local SecSilentAim = TabCombat:DrawSection({ Name = "Silent Aim", Position = "left" })
+
+local SilentAimToggle = SecSilentAim:AddToggle({
+    Name    = "Silent Aim",
+    Flag    = "SilentAimOn",
+    Default = false,
+    Risky   = true,
+    Callback = function(v) silentAimOn = v end,
+})
+
+local SilentAimOptions = SilentAimToggle.Link:AddOption()
+
+SilentAimOptions:AddToggle({
+    Name    = "Team Check",
+    Flag    = "SilentAimTeamCheck",
+    Default = true,
+    Callback = function() end,
+})
+
+SilentAimOptions:AddDropdown({
+    Name    = "Target Part",
+    Flag    = "SilentAimPart",
+    Default = "Head",
+    Values  = {"Head", "HumanoidRootPart"},
+    Callback = function(v)
+        -- используем aimPart (shared) для silent aim target
+        aimPart = v
+    end,
+})
+
+-- Silent Aim: hook Camera:WorldToViewportPoint / WorldToScreenPoint
+-- чтобы подменять позицию цели при выстреле
+local function getSilentAimTarget()
+    local cam = workspace.CurrentCamera
+    local mousePos = UserInputService:GetMouseLocation()
+    local localTeamColor = LocalPlayer.TeamColor
+    local closestPart = nil
+    local closestDist = math.huge
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        local ok, sameTeam = pcall(function() return player.TeamColor == localTeamColor end)
+        -- если team check включён и same team — пропускаем
+        -- (используем флаг SilentAimTeamCheck через Compkiller Flags, упрощённо — берём AimbotTeamCheck)
+        if ok and sameTeam then continue end
+
+        local char = player.Character
+        if not char then continue end
+        local hum = char:FindFirstChild("Humanoid")
+        if not hum or hum.Health <= 0 then continue end
+        local part = char:FindFirstChild(aimPart) or char:FindFirstChild("HumanoidRootPart")
+        if not part then continue end
+
+        local screenPos, onScreen = cam:WorldToViewportPoint(part.Position)
+        if not onScreen then continue end
+
+        local dist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+        if dist < closestDist then
+            closestDist = dist
+            closestPart = part
+        end
+    end
+
+    return closestPart
+end
+
+-- Silent Aim hook через newindex Camera.CFrame или через Ray hook
+-- В Arsenal выстрел идёт через RemoteEvent, поэтому хукаем FireServer
+local function hookSilentAim()
+    local mt = getrawmetatable(game)
+    local oldNamecall = mt.__namecall
+    setreadonly(mt, false)
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        if silentAimOn and method == "FireServer" then
+            local args = {...}
+            -- В Arsenal первый аргумент обычно направление или позиция цели
+            -- Подменяем позицию/направление на позицию ближайшего игрока
+            local target = getSilentAimTarget()
+            if target then
+                local cam = workspace.CurrentCamera
+                -- args[1] обычно направление выстрела (Vector3 unit direction)
+                local dir = (target.Position - cam.CFrame.Position).Unit
+                -- Заменяем первый Vector3 аргумент
+                for i, v in ipairs(args) do
+                    if typeof(v) == "Vector3" then
+                        args[i] = dir
+                        break
+                    end
+                end
+                return oldNamecall(self, table.unpack(args))
+            end
+        end
+        return oldNamecall(self, ...)
+    end)
+    setreadonly(mt, true)
+end
+
+-- Пробуем подключить hook (работает только в эксплойтах с getrawmetatable)
+pcall(hookSilentAim)
 
 -- Triggerbot
 local SecTrigger = TabCombat:DrawSection({ Name = "Triggerbot", Position = "left" })
@@ -391,6 +505,42 @@ SpeedToggle.Link:AddOption():AddSlider({
     Callback = function(v) speedValue = v end,
 })
 
+-- ==================== INFINITE JUMP ====================
+local SecJump = TabPlayer:DrawSection({ Name = "Jump", Position = "left" })
+
+SecJump:AddToggle({
+    Name    = "Infinite Jump",
+    Flag    = "InfiniteJump",
+    Default = false,
+    Callback = function(v) infiniteJumpOn = v end,
+})
+
+-- Infinite Jump: хукаем Humanoid.Jumped
+local infiniteJumpConn = nil
+
+local function connectInfiniteJump(char)
+    if infiniteJumpConn then
+        infiniteJumpConn:Disconnect()
+        infiniteJumpConn = nil
+    end
+    if not char then return end
+    local hum = char:FindFirstChildWhichIsA("Humanoid")
+    if not hum then return end
+
+    infiniteJumpConn = hum.StateChanged:Connect(function(_, new)
+        if infiniteJumpOn and new == Enum.HumanoidStateType.Freefall then
+            task.wait(0.1)
+            if infiniteJumpOn then
+                hum:ChangeState(Enum.HumanoidStateType.Jumping)
+            end
+        end
+    end)
+end
+
+-- Подключаем для текущего персонажа и при каждом респавне
+connectInfiniteJump(LocalPlayer.Character)
+LocalPlayer.CharacterAdded:Connect(connectInfiniteJump)
+
 -- ==================== CONFIG ====================
 local ConfigUI = Window:DrawConfig({
     Name   = "Config",
@@ -474,6 +624,7 @@ RenderStepped:Connect(function()
     fovCircle.Radius = aimbotFOV
 
     -- Aimbot
+    -- ИСПРАВЛЕНО: aimbotSmooth = 1 → мгновенный снап (Lerp factor 1 = полный поворот за кадр)
     if aimbotOn and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
         local closestPart = nil
         local closestDist = aimbotFOV
@@ -501,10 +652,11 @@ RenderStepped:Connect(function()
         end
 
         if closestPart then
-            local smooth = aimbotSmooth > 0 and aimbotSmooth or 1
             local current = cam.CFrame
             local target = CFrame.new(current.Position, closestPart.Position)
-            cam.CFrame = current:Lerp(target, smooth)
+            -- aimbotSmooth = 1 → резкий снап, меньше → плавнее
+            local factor = aimbotSmooth > 0 and aimbotSmooth or 1
+            cam.CFrame = current:Lerp(target, factor)
         end
     end
 
